@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lambda SVG Real‑Time Controller</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+      background: #f5f5f5;
+    }
+    h1 {
+      margin-top: 0;
+      color: #333;
+    }
+    .container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+    .form-container {
+      background: #fff;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      width: 280px;
+      flex: 0 0 auto;
+    }
+    .svg-preview {
+      background: #fff;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      flex: 1 1 600px;
+      overflow: auto;
+    }
+    .form-group {
+      margin-bottom: 12px;
+    }
+    label {
+      display: block;
+      margin-bottom: 4px;
+      font-weight: bold;
+      font-size: 14px;
+    }
+    input[type="text"],
+    input[type="number"],
+    input[type="file"] {
+      width: 100%;
+      padding: 6px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    .buttons {
+      margin-top: 20px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 8px 14px;
+      background: #007bff;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover {
+      background: #0056b3;
+    }
+    button:disabled {
+      background: #6c757d;
+      cursor: not-allowed;
+    }
+    svg {
+      max-width: 100%;
+      height: auto;
+    }
+  </style>
+  <!-- External libraries for PDF export -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" integrity="sha512-BNa5s0BCKrHn9nR/j3FhtKEf0pOaxT6Gj06uWd75mYyF7iKXD8SOkh7xjw+opdWeOZNwk6ocU2Cy69slsuUhvA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" integrity="sha512-YpXXu0GUoXy2ciB9U156t6WgViBGw5R0VvlUWEh5cZjA4Y98mawGxRA0oeh+EA8Cuy7iUT7dqN4ocqZU1eic6g==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+</head>
+<body>
+  <h1>Lambda SVG Real‑Time Controller</h1>
+  <p>This demo lets you load an SVG containing <code>λ:vars</code> definitions, automatically builds a form to edit those variables, and updates the SVG in real time. If any <code>λ:js</code> expressions are present on the elements, they will be executed to compute derived values. You can export the current state to a high‑resolution (1200 DPI) letter‑sized PDF.</p>
+  <div class="container">
+    <div class="form-container" id="form-container">
+      <div class="form-group">
+        <label for="svgUpload">Load SVG file(s):</label>
+        <!-- Allow selecting multiple files so users can build multi‑page templates in one step -->
+        <input type="file" id="svgUpload" accept=".svg" multiple>
+      </div>
+      <!-- Hidden input used when adding additional pages -->
+      <input type="file" id="addSvgUpload" accept=".svg" style="display: none;">
+      <div class="buttons">
+        <button id="add-svg-btn" disabled>Add SVG Page</button>
+        <button id="save-template-btn" disabled>Save Template</button>
+        <button id="save-profile-btn" disabled>Save Profile</button>
+        <button id="load-profile-btn" disabled>Load Profile</button>
+      </div>
+      <!-- Hidden input used when loading a saved profile -->
+      <input type="file" id="loadProfileUpload" accept="application/json" style="display: none;">
+      <div id="vars-form-placeholder">
+        <p><em>Upload an SVG to populate form fields.</em></p>
+      </div>
+    </div>
+    <div class="svg-preview">
+      <div id="svgContainer"></div>
+      <div class="buttons">
+        <button id="export-pdf-btn" disabled>Export to PDF</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    // Global state for variables and pages
+    const vars = {};
+    const pages = [];
+    // Combined element mappings and functions across all pages
+    let globalElementMappings = [];
+    let globalGlobalFunctions = [];
+    let globalVarOccurrences = {};
+    // Variables that should not appear as form fields because they are computed via λ:js only
+    let skipVariables = new Set();
+
+    // Note: skipVariables will be populated dynamically in parseSVG based on λ:js usage.
+
+    // Load an SVG page from text and add it to the document
+    function loadSVGText(svgText) {
+      addPage(svgText);
+      document.getElementById('export-pdf-btn').disabled = false;
+  // Once a page is loaded, enable the Add SVG button so users can append further pages
+  document.getElementById('add-svg-btn').disabled = false;
+  // Enable saving and loading profile/template buttons
+  document.getElementById('save-template-btn').disabled = false;
+  document.getElementById('save-profile-btn').disabled = false;
+  document.getElementById('load-profile-btn').disabled = false;
+    }
+
+    // Parse a single SVG element and return its mappings and occurrence map
+    function parsePage(svg) {
+      const elementMappings = [];
+      const varOccurrences = {};
+      const pageFunctions = [];
+      const lambdaElems = svg.querySelectorAll('[λ\\:vars]');
+      lambdaElems.forEach(el => {
+        const varsAttr = el.getAttribute('λ:vars');
+        if (!varsAttr) return;
+        const tokens = varsAttr.trim().split(/[\s_]+/).filter(Boolean);
+        const names = tokens.filter(tok => /^[A-Za-z_][A-Za-z0-9_]*$/.test(tok)).map(name => name.replace(/:$/, ''));
+        const jsCode = el.getAttribute('λ:js');
+        const attrsList = el.getAttribute('λ:attrs');
+        elementMappings.push({ el, varNames: names, jsCode, attrsList });
+        names.forEach(name => {
+          if (!varOccurrences[name]) varOccurrences[name] = [];
+          varOccurrences[name].push({ jsCode });
+        });
+      });
+      const jsTags = svg.querySelectorAll('λ\\:js, js');
+      jsTags.forEach(tag => {
+        const code = tag.textContent || tag.innerHTML || '';
+        try {
+          const fn = new Function('vars', code);
+          pageFunctions.push(fn);
+        } catch (e) {
+          console.error('Error compiling λ:js function', e);
+        }
+      });
+      return { elementMappings, varOccurrences, pageFunctions };
+    }
+
+    // Add a new page to the document
+    function addPage(svgText) {
+      const pageContainer = document.createElement('div');
+      pageContainer.className = 'page';
+      pageContainer.innerHTML = svgText;
+      document.getElementById('svgContainer').appendChild(pageContainer);
+      const svg = pageContainer.querySelector('svg');
+      if (!svg) return;
+      const pageData = parsePage(svg);
+      pages.push({ container: pageContainer, ...pageData });
+      // Merge element mappings and global functions
+      globalElementMappings.push(...pageData.elementMappings);
+      globalGlobalFunctions.push(...pageData.pageFunctions);
+      // Merge var occurrences
+      Object.keys(pageData.varOccurrences).forEach(name => {
+        if (!globalVarOccurrences[name]) globalVarOccurrences[name] = [];
+        globalVarOccurrences[name].push(...pageData.varOccurrences[name]);
+      });
+      // Recompute skip variables and form variables
+      skipVariables = new Set();
+      const formVars = [];
+      Object.keys(globalVarOccurrences).forEach(name => {
+        const occurrences = globalVarOccurrences[name];
+        const needsInput = occurrences.some(item => {
+          const js = item.jsCode;
+          if (!js) return true;
+          const decoded = js.replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&');
+          return /\$\d+/.test(decoded);
+        });
+        if (needsInput) {
+          formVars.push(name);
+        } else {
+          skipVariables.add(name);
+        }
+      });
+      buildForm(formVars);
+      updateAll();
+    }
+
+    // Determine if a variable is used in an image element across any page
+    function isImageVariable(name) {
+      return globalElementMappings.some(info => {
+        return info.varNames.includes(name) && info.el.tagName.toLowerCase() === 'image';
+      });
+    }
+
+    function buildForm(varNames) {
+      const container = document.getElementById('vars-form-placeholder');
+      container.innerHTML = '';
+      if (varNames.length === 0) {
+        container.innerHTML = '<p><em>No λ:vars definitions found in the SVG.</em></p>';
+        return;
+      }
+      varNames.forEach(name => {
+        // Skip variables that are auto‑computed and should not have input fields
+        if (skipVariables.has(name)) {
+          // Initialize variable to empty; will be computed by λ:js
+          vars[name] = vars[name] || '';
+          return;
+        }
+        const group = document.createElement('div');
+        group.className = 'form-group';
+        const label = document.createElement('label');
+        label.textContent = name + ':';
+        label.setAttribute('for', 'var-' + name);
+        let input;
+        if (isImageVariable(name)) {
+          input = document.createElement('input');
+          input.type = 'file';
+          input.accept = 'image/*';
+          input.addEventListener('change', (e) => handleFileInput(e, name));
+          // Cannot set file input value due to browser security; user must reselect when reopening
+        } else {
+          input = document.createElement('input');
+          input.type = 'text';
+          // Prepopulate input with existing variable value if available
+          input.value = vars[name] || '';
+          input.addEventListener('input', (e) => {
+            vars[name] = e.target.value;
+            updateAll();
+          });
+        }
+        input.id = 'var-' + name;
+        // Preserve existing value for this variable if available; otherwise default to empty string
+        if (vars[name] === undefined) {
+          vars[name] = '';
+        }
+        group.appendChild(label);
+        group.appendChild(input);
+        container.appendChild(group);
+      });
+    }
+
+    // Handle image file input and convert to data URL
+    function handleFileInput(event, name) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        vars[name] = e.target.result;
+        updateAll();
+      };
+      reader.readAsDataURL(file);
+    }
+
+    // Evaluate λ:js expressions to compute output
+    function evaluateExpression(code, values) {
+      if (!code) return values.join(' ');
+      let js = code.trim();
+      // Decode common HTML entities
+      js = js.replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&');
+      // Remove surrounding braces if present
+      if (js.startsWith('{') && js.endsWith('}')) {
+        js = js.slice(1, -1);
+      }
+      // Build argument names $1, $2 etc
+      const argNames = values.map((_, i) => '$' + (i + 1));
+      try {
+        const fn = new Function(...argNames, 'return (' + js + ')');
+        return fn(...values);
+      } catch (e) {
+        console.error('Error evaluating λ:js expression:', js, e);
+        return '';
+      }
+    }
+
+    // Update all mapped elements and run global functions
+    function updateAll() {
+      globalElementMappings.forEach(info => {
+        const { el, varNames, jsCode, attrsList } = info;
+        const values = varNames.map(name => vars[name] || '');
+        let result;
+        if (jsCode) {
+          result = evaluateExpression(jsCode, values);
+        } else {
+          // If no JS, join values with space
+          result = values.join(' ');
+        }
+        // If attrsList is specified, update those attributes
+        if (attrsList) {
+          const attrs = attrsList.split(/\s*,\s*/).filter(Boolean);
+          attrs.forEach(attr => {
+            // Namespaced attributes like xlink:href require namespace
+            if (attr.includes(':')) {
+              const [prefix, local] = attr.split(':');
+              // Only xlink supported here
+              let ns = null;
+              if (prefix === 'xlink') {
+                ns = 'http://www.w3.org/1999/xlink';
+              }
+              if (ns) {
+                el.setAttributeNS(ns, local, result);
+              } else {
+                el.setAttribute(attr, result);
+              }
+            } else {
+              el.setAttribute(attr, result);
+            }
+          });
+        } else {
+          // Otherwise update text content
+          el.textContent = result;
+        }
+        // If this element calculates a variable that is marked as skip and has a single variable, store the computed value
+        if (jsCode && varNames.length === 1 && skipVariables.has(varNames[0])) {
+          vars[varNames[0]] = result;
+        }
+      });
+      // Run any global λ:js functions
+      globalGlobalFunctions.forEach(fn => {
+        try {
+          fn(vars);
+        } catch (e) {
+          console.error('Error running global λ:js function', e);
+        }
+      });
+    }
+
+    // Export the current SVG preview(s) to a multi‑page PDF
+    document.getElementById('export-pdf-btn').addEventListener('click', async () => {
+      const dpi = 1200;
+      const scale = dpi / 96; // assuming 96 DPI CSS resolution
+      const widthInches = 8.5;
+      const heightInches = 11;
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF({ unit: 'in', format: 'letter' });
+      const pageEls = document.querySelectorAll('#svgContainer .page');
+      for (let i = 0; i < pageEls.length; i++) {
+        const pageEl = pageEls[i];
+        const canvas = await html2canvas(pageEl, { scale: scale, backgroundColor: '#ffffff' });
+        const imgData = canvas.toDataURL('image/png');
+        if (i > 0) pdf.addPage('letter', 'portrait');
+        pdf.addImage(imgData, 'PNG', 0, 0, widthInches, heightInches);
+      }
+      pdf.save('lambda_svg_export.pdf');
+    });
+
+    // When a user selects one or more SVG files, read them and load each as a new page
+    document.getElementById('svgUpload').addEventListener('change', (event) => {
+      const files = event.target.files;
+      if (!files || files.length === 0) return;
+      // Process each selected file individually
+      Array.from(files).forEach(file => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          loadSVGText(e.target.result);
+        };
+        reader.readAsText(file);
+      });
+      // Reset the file input so the same file(s) can be selected again later
+      event.target.value = '';
+    });
+
+    // When the Add SVG Page button is clicked, trigger the hidden file input
+    document.getElementById('add-svg-btn').addEventListener('click', () => {
+      document.getElementById('addSvgUpload').click();
+    });
+
+    // Handle selection of additional SVG files via the hidden input
+    document.getElementById('addSvgUpload').addEventListener('change', (event) => {
+      const files = event.target.files;
+      if (!files || files.length === 0) return;
+      Array.from(files).forEach(file => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          loadSVGText(e.target.result);
+        };
+        reader.readAsText(file);
+      });
+      // Reset hidden input so same file can be selected again later
+      event.target.value = '';
+    });
+
+    // Save the current loaded template (pages) to a JSON file
+    document.getElementById('save-template-btn').addEventListener('click', () => {
+      // Build an array of page HTML strings
+      const templateData = { pages: pages.map(p => p.container.innerHTML) };
+      const blob = new Blob([JSON.stringify(templateData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'template.json';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    });
+
+    // Save the current user input data (profile) to a JSON file
+    document.getElementById('save-profile-btn').addEventListener('click', () => {
+      const profile = {};
+      Object.keys(vars).forEach(name => {
+        // Only save variables that are user editable (not auto-computed skip variables)
+        if (!skipVariables.has(name)) {
+          profile[name] = vars[name];
+        }
+      });
+      const blob = new Blob([JSON.stringify({ vars: profile }, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'profile.json';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    });
+
+    // Trigger loading of a saved profile
+    document.getElementById('load-profile-btn').addEventListener('click', () => {
+      document.getElementById('loadProfileUpload').click();
+    });
+
+    // Handle uploaded profile JSON and repopulate variables
+    document.getElementById('loadProfileUpload').addEventListener('change', (event) => {
+      const files = event.target.files;
+      if (!files || files.length === 0) return;
+      const file = files[0];
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = JSON.parse(e.target.result);
+          const loadedVars = data.vars || data.profile || data;
+          Object.keys(loadedVars).forEach(name => {
+            if (vars.hasOwnProperty(name)) {
+              vars[name] = loadedVars[name];
+            }
+          });
+          // Update form inputs to match loaded values
+          Object.keys(loadedVars).forEach(name => {
+            const input = document.getElementById('var-' + name);
+            if (input && input.type !== 'file') {
+              input.value = loadedVars[name];
+            }
+          });
+          updateAll();
+        } catch (err) {
+          console.error('Error loading profile JSON', err);
+        }
+      };
+      reader.readAsText(file);
+      // Reset input so same file can be selected again later
+      event.target.value = '';
+    });
+
+    // Attempt to load a default SVG named "yes1.svg" if the page is served from HTTP(S).
+    (function tryLoadDefault() {
+      if (location.protocol === 'file:') return; // Don't fetch default on file protocol
+      fetch('yes1.svg').then(resp => {
+        if (!resp.ok) throw new Error('Failed');
+        return resp.text();
+      }).then(text => {
+        // Populate SVG and form automatically
+        loadSVGText(text);
+      }).catch(() => {
+        // ignore; user can upload manually
+      });
+    })();
+  </script>
+</body>
+</html>

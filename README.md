@@ -1,2 +1,2 @@
-# lambda_templater
-create html forms to edit svg elements in real time
+# lambda-templater
+create html forms to modify svg xml elements in real time
